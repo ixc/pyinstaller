@@ -24,7 +24,8 @@ import os
 # and also reads the user settings from DJANGO_SETTINGS_MODULE.
 # https://stackoverflow.com/questions/24793351/django-appregistrynotready
 import django
-django.setup()
+if hasattr(django, 'setup'):  # Added in Django 1.7
+    django.setup()
 
 # This allows to access all django settings even from the settings.py module.
 from django.conf import settings

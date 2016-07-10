@@ -17,103 +17,171 @@ NOTE: With newer version of Django this is most likely the part of PyInstaller
 Tested with Django 1.8.
 """
 
-
-import os
-
 # Calling django.setup() avoids the exception AppRegistryNotReady()
-# and also reads the user settings from DJANGO_SETTINGS_MODULE.
+# and also reads the project settings from DJANGO_SETTINGS_MODULE.
 # https://stackoverflow.com/questions/24793351/django-appregistrynotready
 import django
 if hasattr(django, 'setup'):  # Added in Django 1.7
     django.setup()
 
-# This allows to access all django settings even from the settings.py module.
+import importlib
+import logging
+
 from django.conf import settings
+from django.core.urlresolvers import RegexURLPattern, RegexURLResolver
 
-from PyInstaller.utils.hooks import collect_submodules
+logger = logging.getLogger(__name__)
+
+hiddenimports = []
+
+# Use a settings attribute, or a tuple of attributes/keys for nested settings
+# (e.g. DATABASES, LOGGING, etc.) Use "*" to iterate over a list/tuple or the
+# values of a dict. Below are all settings that might contain a Python dotted
+# path, according to Django 1.9 docs.
+SETTINGS = (
+    'AUTH_PASSWORD_VALIDATORS',
+    'AUTHENTICATION_BACKENDS',
+    'CSRF_FAILURE_VIEW',
+    'DATABASE_ROUTERS',
+    'DEFAULT_EXCEPTION_REPORTER_FILTER',
+    'DEFAULT_FILE_STORAGE',
+    'EMAIL_BACKEND',
+    'FILE_UPLOAD_HANDLERS',
+    'FORMAT_MODULE_PATH',
+    'FORMAT_MODULE_PATH',
+    'INSTALLED_APPS',
+    'LOGGING_CONFIG',
+    'LOGIN_REDIRECT_URL',  # Deprecated in 1.8
+    'LOGIN_URL',  # Deprecated in 1.8
+    'MESSAGE_STORAGE',
+    'MIDDLEWARE_CLASSES',
+    'PASSWORD_HASHERS',
+    'ROOT_URLCONF',
+    'SESSION_ENGINE',
+    'SESSION_SERIALIZER',
+    'SIGNING_BACKEND',
+    'STATICFILES_FINDERS',
+    'STATICFILES_STORAGE',
+    'TEMPLATE_CONTEXT_PROCESSORS',  # Deprecated in 1.8
+    'TEMPLATE_LOADERS',  # Deprecated in 1.8
+    'TEST_RUNNER',
+    'WSGI_APPLICATION',
+    ('CACHES', '*', 'BACKEND'),
+    ('CACHES', '*', 'KEY_FUNCTION'),
+    ('DATABASES', '*', 'ENGINE'),
+    ('DATABASES', '*', 'TEST', 'ENGINE'),
+    ('LOGGING', '*', '*', '()'),
+    ('LOGGING', '*', '*', 'class'),
+    ('MIGRATION_MODULES', '*'),
+    ('SERIALIZATION_MODULES', '*'),
+    ('TEMPLATES', 'BACKEND'),
+    ('TEMPLATES', 'OPTIONS', 'context_processors'),
+    ('TEMPLATES', 'OPTIONS', 'loaders'),
+)
 
 
-hiddenimports = list(settings.INSTALLED_APPS) + \
-                 list(settings.TEMPLATE_CONTEXT_PROCESSORS) + \
-                 list(settings.TEMPLATE_LOADERS) + \
-                 [settings.ROOT_URLCONF]
+def get_nested_settings(keys, value):
+    keys = list(keys)  # Copy keys as list, so we can pop items from it
+    hiddenimports = []
+    if keys:
+        key = keys.pop(0)
+        if key == '*':
+            # Convert dict values to a list.
+            if isinstance(value, dict):
+                value = value.values()
+            # Recurse to get value from all items in list.
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    hiddenimports.extend(get_nested_settings(keys, item))
+        else:
+            # Get value from dict or object.
+            if isinstance(value, dict):
+                value = value.get(key, None)
+            else:
+                value = getattr(value, key, None)
+            # Recurse when there are still more nested keys.
+            if keys:
+                hiddenimports.extend(get_nested_settings(keys, value))
+            # Add non-empty values for key to hidden imports.
+            elif value:
+                if isinstance(value, (list, tuple)):
+                    hiddenimports.extend(list(value))
+                else:
+                    hiddenimports.append(value)
+    return hiddenimports
 
+# Get hidden imports from settings.
+for keys in SETTINGS:
+    if not isinstance(keys, (list, tuple)):
+        keys = (keys, )
+    value = get_nested_settings(keys, settings)
+    if value:
+        logger.info('Found hidden import(s) in Django setting(s) %s: %s' % (
+            ' > '.join(keys),
+            ', '.join(value),
+        ))
+        hiddenimports.extend(value)
 
-def _remove_class(class_name):
-    return '.'.join(class_name.split('.')[0:-1])
-
-
-### Changes in Django 1.7.
-
-# Remove class names and keep just modules.
-if hasattr(settings, 'AUTHENTICATION_BACKENDS'):
-    for cl in settings.AUTHENTICATION_BACKENDS:
-        cl = _remove_class(cl)
-        hiddenimports.append(cl)
-if hasattr(settings, 'DEFAULT_FILE_STORAGE'):
-    cl = _remove_class(settings.DEFAULT_FILE_STORAGE)
-    hiddenimports.append(cl)
-if hasattr(settings, 'FILE_UPLOAD_HANDLERS'):
-    for cl in settings.FILE_UPLOAD_HANDLERS:
-        cl = _remove_class(cl)
-        hiddenimports.append(cl)
-if hasattr(settings, 'MIDDLEWARE_CLASSES'):
-    for cl in settings.MIDDLEWARE_CLASSES:
-        cl = _remove_class(cl)
-        hiddenimports.append(cl)
-# Templates is a dict:
-if hasattr(settings, 'TEMPLATES'):
-    for templ in settings.TEMPLATES:
-        backend = _remove_class(templ['BACKEND'])
-        # Include context_processors.
-        if hasattr(templ, 'OPTIONS'):
-            if hasattr(templ['OPTIONS'], 'context_processors'):
-                # Context processors are functions - strip last word.
-                mods = templ['OPTIONS']['context_processors']
-                mods = [_remove_class(x) for x in mods]
-                hiddenimports += mods
-# Include database backends - it is a dict.
-for v in settings.DATABASES.values():
-    hiddenimports.append(v['ENGINE'])
+# Get hidden imports from installed AppConfig classes.
+for app in settings.INSTALLED_APPS:
+    try:
+        importlib.import_module(app)
+    except ImportError:
+        logger.debug('Failed to import module or package: %s' % app)
+        bits = app.split('.')
+        mod = importlib.import_module('.'.join(bits[:-1]))
+        config = getattr(mod, bits[-1])
+        logger.info('Found hidden import in INSTALLED_APPS %s: %s' % (
+            app,
+            config.name,
+        ))
+        hiddenimports.append(config.name)
 
 
 def find_url_callbacks(urls_module):
+    hiddenimports = set()  # Use a set to de-dupe
     if isinstance(urls_module, list):
         urlpatterns = urls_module
-        hid_list = []
     else:
         urlpatterns = urls_module.urlpatterns
-        hid_list = [urls_module.__name__]
     for pattern in urlpatterns:
         if isinstance(pattern, RegexURLPattern):
-            hid_list.append(pattern.callback.__module__)
+            hiddenimports.add(pattern.callback.__module__)
         elif isinstance(pattern, RegexURLResolver):
-            hid_list += find_url_callbacks(pattern.urlconf_module)
-    return hid_list
+            hiddenimports.update(find_url_callbacks(pattern.urlconf_module))
+    return list(hiddenimports)
 
+# Get hidden imports from root URLconf.
+if hasattr(settings, 'ROOT_URLCONF'):
+    value = find_url_callbacks(importlib.import_module(settings.ROOT_URLCONF))
+    if value:
+        logger.info('Found hidden import(s) in root URLconf %s: %s' % (
+            settings.ROOT_URLCONF,
+            ', '.join(value),
+        ))
+        hiddenimports.extend(value)
 
-# Add templatetags and context processors for each installed app.
-for app in settings.INSTALLED_APPS:
-    app_templatetag_module = app + '.templatetags'
-    app_ctx_proc_module = app + '.context_processors'
-    hiddenimports.append(app_templatetag_module)
-    hiddenimports += collect_submodules(app_templatetag_module)
-    hiddenimports.append(app_ctx_proc_module)
+# Some hidden imports might be a class or function, or not be a dotted path at
+# all. Traverse up the dotted path until we get an importable module or
+# package, and de-dupe.
+packages = set()
+for mod in hiddenimports:
+    while mod:
+        if mod in packages:  # Already seen
+            break
+        try:
+            importlib.import_module(mod)  # Importable?
+        except ImportError:
+            # Drop last part of dotted path and try again.
+            logger.debug('Failed to import module or package: %s' % mod)
+            mod = '.'.join(mod.split('.')[:-1])
+            continue
+        packages.add(mod)
+        break
 
-
-from django.core.urlresolvers import RegexURLPattern, RegexURLResolver
-
-
-# Construct base module name - without 'settings' suffix.
-base_module_name = '.'.join(os.environ['DJANGO_SETTINGS_MODULE'].split('.')[0:-1])
-base_module = __import__(base_module_name, {}, {}, ["urls"])
-urls = base_module.urls
-
-# Find url imports.
-hiddenimports += find_url_callbacks(urls)
-
-# Deduplicate imports.
-hiddenimports = list(set(hiddenimports))
+if packages:
+    logger.info('Found hidden imports in Django project: %s' % ', '.join(
+        sorted(packages)))
 
 # This print statement is then parsed and evaluated as Python code.
-print(hiddenimports)
+print(list(sorted(packages)))
